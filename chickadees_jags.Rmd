@@ -1,0 +1,466 @@
+---
+title: "jags_survival"
+author: "DLN"
+date: "June 15, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###############################################################################################
+######7. Estimation of survival from capture-recapture data using the Cormack-Jolly-Seber (CJS) model
+###############################################################################################
+
+```{r}
+library(stringr)
+library(R2WinBUGS)
+library(R2jags)
+
+library(tidyr)
+library(dplyr)
+
+setwd("C:/Users/MTHallworth/Documents/DESIREE/demography chickadees/demography analysis/JAGS")
+```
+#Data 
+```{r}
+## Upload Data
+## Chickadee Encounters
+       
+ch<-read.csv("C:/Users/MTHallworth/Documents/DESIREE/demography chickadees/demography analysis/data management/capturehistory_2017-03-01.csv",
+             colClasses = "character") %>%
+    mutate(bandnum=bandNumberQuery) %>%
+    mutate(ch=capture_history) %>%
+    select(site, bandnum,ch, years_seen)
+
+
+
+## Year Data
+year<-read.csv("C:/Users/MTHallworth/Documents/DESIREE/demography chickadees/demography analysis/csv/yearvalues_12feb2017.csv") %>%
+  select(year, peakcherry_juldate, average_wintertemp)
+
+## Body Condition
+bodycondition<-read.csv("C:/Users/MTHallworth/Documents/DESIREE/demography chickadees/demography analysis/bodycondition/CACH_bodycondition_2017-03-01.csv") %>%
+  mutate(site=site.x) %>%
+   select(bandnum, age, sex, condition)
+
+## Imperv
+#imperv<-read.csv("C:/Users/dnarango/Desktop/GIS SPATIAL LAYERS - IMPERV/Imperv_buffer_100_2017-03-01.csv") %>%
+#  mutate(site=id) %>%  
+#  select(site, per_imperv)
+    
+
+
+## Plants
+exotic<-read.csv("C:/Users/MTHallworth/Documents/DESIREE/demography chickadees/veg/plantorigin_IV- 2017-03-23.csv") %>%
+  select(site, exotic_tree,exotic_shrub) %>%
+  mutate(exotic_type=ifelse(exotic_tree>100,"exotic","native"))
+
+
+```
+Data Manipulation
+```{r message=FALSE}
+
+
+## Add Data Together
+survival<-ch %>%
+    #left_join(imperv, by="site") %>%
+    left_join(bodycondition, by="bandnum") %>%
+    left_join(exotic, by="site")
+          
+## Adds the mean where there are NAs
+#survival$per_imperv[is.na(survival$per_imperv)]<-mean(na.omit(survival$per_imperv))
+
+
+## Include only adults with known sex
+adults<-survival %>%
+        filter(age!="HY")%>%
+        filter(age!="L")%>%
+        filter(age!="U")%>%
+        filter(age!="ASY?") %>%
+        #filter(sex!="M?") %>%
+        #filter(sex!="UNK") %>%
+        #filter(sex!="U")
+        filter(exotic_tree!="NA")
+
+adults<-na.omit(adults)
+
+
+```
+
+Construct Matrix
+```{r}
+### need a matrix with x: capture year and y: individual
+
+#[,1] [,2] [,3] [,4] [,5] [,6]
+#[1,]    1    0    0    0    0    0
+#[2,]    1    0    0    0    0    0
+#[3,]    1    1    1    1    1    1
+#[4,]    1    1    0    0    0    0
+#[5,]    1    0    0    0    0    0
+#[6,]    1    1    0    0    1    0
+
+ch<-as.matrix(str_split_fixed(adults$ch, "", 15))
+
+class(ch) <- "numeric" 
+matrix<-ch
+
+## also need vector with marking occassion (year marked)
+get.first <- function(x) min(which(x!=0)) #make function
+VECTOR <- apply(matrix, 1, get.first)
+```
+
+######################################################################################
+#### BUGS
+
+A base model
+```{r}
+bugs.dir=("C:/Program Files (x86)/WinBUGS14")
+
+# Specify model in BUGS language
+sink("cjs-c-c.bug")
+cat("                          ##starts the bugs code
+    model {
+      
+# Priors and constraints
+      phi ~ dunif(0, 1)            ### Uniform priors  (could use: phi[i,t] <- mean.phi for mean survival)
+      p ~ dunif(0, 1)             ### Uniform priors
+      
+      
+      # Likelihood 
+      for (i in 1:nind){
+        # Define latent state at first capture
+        z[i,f[i]] <- 1
+        for (t in (f[i]+1):n.occasions){
+          
+          # State process
+          z[i,t] ~ dbern(mu1[i,t])
+          mu1[i,t] <- phi * z[i,t-1]		# Depends on whether ind was alive the time before
+          
+          # Observation process
+          y[i,t] ~ dbern(mu2[i,t])
+          mu2[i,t] <- p * z[i,t]			# Depends on the whether ind alive that time period
+        } #t
+      } #i
+    }
+    ",fill = TRUE)
+sink()
+
+# Bundle data
+bugs.data <- list(y = matrix, f = VECTOR, nind = nrow(matrix), n.occasions = ncol(matrix))
+
+# Function to create a matrix of initial values for latent state z
+ch.init <- function(ch, f){
+  for (i in 1:dim(ch)[1]){ch[i,1:f[i]] <- NA}
+  return(ch)
+}
+
+# Initial values
+inits <- function(){list(z = ch.init(matrix, VECTOR), phi = runif(1, 0, 1), p = runif(1, 0, 1))}
+
+# Parameters monitored
+parameters <- c("phi", "p")
+
+# MCMC settings
+ni <- 1000
+nt <- 6
+nb <- 500
+nc <- 3
+
+# Call WinBUGS from R (BRT 1 min)
+
+directory<-"C:/Users/MTHallworth/Documents/DESIREE/demography chickadees/demography analysis/BUGS code"
+
+cjs.c.c <- bugs(bugs.data, inits, parameters, "cjs-c-c.bug", n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb, debug = TRUE, bugs.directory = bugs.dir, working.directory = getwd())
+
+# Summarize posteriors
+print(cjs.c.c, digits = 3)
+```
+
+
+# To run in JAGS
+# In JAGS we have to give good initial values for the latent state z. At all occasions when an individual was 
+# observed, its state is z = 1 for sure. In addition, if an individual was not observed at an occasion, 
+#but was alive for sure, because it was observed before and thereafter (i.e. has a capture history of e.g. {101} 
+#or {10001}), then we know that the individual was alive at all of these occasions, and thus z = 1. 
+#Therefore, we should provide initial values of z = 1 at these positions as well. The following function 
+#provides such initial values from the observed capture histories:
+```{r}
+known.state.cjs <- function(ch){
+  state <- ch
+  for (i in 1:dim(ch)[1]){
+    n1 <- min(which(ch[i,]==1))
+    n2 <- max(which(ch[i,]==1))
+    state[i,n1:n2] <- 1
+    state[i,n1] <- NA
+  }
+  state[state==0] <- NA
+  return(state)
+}
+
+JAGS_inits <- function(){list(phi = runif(1, 0, 1), p = runif(1, 0, 1), z = known.state.cjs(matrix))}
+
+cjs.c.cJ <- jags(bugs.data, JAGS_inits, parameters, "cjs-c-c.bug", n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb)
+
+# Summarize posteriors
+print(cjs.c.cJ, digits = 3)
+```
+model to run
+
+survival ~ exoticplants + sex + (1~ year)
+survival ~ exoticplants + imperv + sex + (1~ year)
+
+
+Random Time Model
+
+```{r}
+sink("cjs-temp-raneff.bug")
+cat("
+model {
+
+# Priors and constraints
+for (i in 1:nind){
+   for (t in f[i]:(n.occasions-1)){
+      logit(phi[i,t]) <- mu + epsilon[t]
+      p[i,t] <- mean.p
+      } #t
+   } #i
+for (t in 1:(n.occasions-1)){
+   epsilon[t] ~ dnorm(0, tau)
+   }
+
+#mu ~ dnorm(0, 0.001)                    # Prior for logit of mean survival
+#mean.phi <- 1 / (1+exp(-mu))            # Logit transformation
+mean.phi ~ dunif(0, 1)                   # Prior for mean survival
+mu <- log(mean.phi / (1-mean.phi))       # Logit transformation
+sigma ~ dunif(0, 10)                     # Prior for standard deviation
+tau <- pow(sigma, -2)
+sigma2 <- pow(sigma, 2)                  # Temporal variance
+mean.p ~ dunif(0, 1)                     # Prior for mean recapture
+
+# Likelihood 
+for (i in 1:nind){
+   # Define latent state at first capture
+   z[i,f[i]] <- 1
+   for (t in (f[i]+1):n.occasions){
+      # State process
+      z[i,t] ~ dbern(mu1[i,t])
+      mu1[i,t] <- phi[i,t-1] * z[i,t-1]
+      # Observation process
+      y[i,t] ~ dbern(mu2[i,t])
+      mu2[i,t] <- p[i,t-1] * z[i,t]
+      } #t
+   } #i
+}
+",fill = TRUE)
+sink()
+
+# Bundle data
+bugs.data <- list(y = ch, f = VECTOR, nind = dim(ch)[1], n.occasions = dim(ch)[2])
+
+# Function to create a matrix of initial values for latent state z
+ch.init <- function(ch, f){
+   for (i in 1:dim(ch)[1]){ch[i,1:f[i]] <- NA}
+   return(ch)
+   }
+
+# Initial values
+inits <- function(){list(z = ch.init(ch, VECTOR), mean.phi = runif(1, 0, 1), mean.p = runif(1, 0, 1))}
+
+# Parameters monitored
+parameters <- c("mean.phi", "mean.p")
+
+# MCMC settings
+ni <- 10000
+nt <- 6
+nb <- 5000
+nc <- 3
+
+
+JAGS_inits <- function(){list(mean.phi = runif(1, 0, 1), mean.p = runif(1, 0, 1), z = known.state.cjs(matrix))}
+
+cjs.c.cJ <- jags(bugs.data, JAGS_inits, parameters, "cjs-temp-raneff.bug", n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb)
+
+# Summarize posteriors
+print(cjs.c.cJ, digits = 3)
+
+
+
+```
+
+New model
+Includes survival by sex, fixed effects exotic and allows survival to vary each year
+```{r}
+# Specify model in BUGS language
+sink("cjs-sex_time_exotic_imperv.bug")
+cat("                          ##starts the bugs code
+    model {
+      
+# Priors and constraints
+for(s in 1:3){
+p[s] ~ dunif(0, 1)             ### Uniform priors differs by sex 
+for(t in 1:n.occasions){
+phi.t[s,t] ~ dunif(0, 1) ### Uniform priors  (could use: phi[i,t] <- mean.phi for mean survival)
+}
+}
+
+for(n in 1:ncovs){
+beta[n]~dnorm(0,0.001)
+}
+
+      # Likelihood 
+      for (i in 1:nind){
+        # Define latent state at first capture
+        z[i,f[i]] <- 1
+
+        for (t in (f[i]+1):n.occasions){
+          
+          # State process
+          z[i,t] ~ dbern(mu1[i,t])
+          
+          mu1[i,t] <- (exp(phi.t[sex[i],t]+
+                          beta[1]*exotic[i]
+                          #beta[2]*imperv[i]*
+                          *z[i,t-1])/
+                      (1 + exp(phi.t[sex[i],t]+
+                          beta[1]*exotic[i]
+                          #beta[2]*imperv[i]
+                          *z[i,t-1])))  # Depends on whether ind was alive the time before
+          
+          # Observation process
+          y[i,t] ~ dbern(mu2[i,t])
+          mu2[i,t] <- p[sex[i]] * z[i,t]			# Depends on the whether ind alive that time period
+        } #t
+      } #i
+# Derived paramters
+for(s in 1:3){ #sex
+mean.phi[s]<-mean(phi.t[s,])
+}
+
+    }
+    ",fill = TRUE)
+sink()
+```
+
+```{r}
+parameters <- c("mean.phi","beta","phi.t","p")
+
+occasions<-ncol(ch)
+covariates<-2
+
+adults2<-adults %>%
+          mutate(sex2=ifelse(sex=="F",1,ifelse(sex=="M",2,ifelse(sex=="M?",2,3))))
+sex<-adults2$sex2
+
+exotic<-(adults$exotic_tree-mean(adults$exotic_tree))/sd(adults$exotic_tree)
+
+individuals<-nrow(matrix)
+
+
+bugs.data <- list(nind=individuals,
+                  n.occasions = occasions,
+                  ncovs = covariates,
+                  sex = sex,
+                  exotic = exotic,
+                 # imperv = 
+                  y = matrix,
+                 f=VECTOR)
+
+JAGS_inits <- function(){list(z = known.state.cjs(matrix))}
+
+# MCMC settings
+ni <- 10000
+nt <- 6
+nb <- 5000
+nc <- 3
+
+cjs.exotic <- jags(data = bugs.data, 
+                 inits = JAGS_inits, 
+                 parameters.to.save = parameters, 
+                 model = "cjs-sex_time_exotic_imperv.bug", 
+                 n.chains = nc,
+                 n.thin = nt,
+                 n.iter = ni,
+                 n.burnin = nb)
+
+# Summarize posteriors
+print(cjs.exotic, digits = 3)
+```
+
+
+Predictions
+
+``{r}
+prediction<-data.frame(exotic=rep(seq(-1.2,3.2, by=0.01),2), 
+                        sex=as.factor(rep(1:2,each=441)), 
+                        mean.phi=rep(c(0.5,0.49),each=441),beta=rep(c(-0.038,-0.038),each=441),
+                        low=rep(c(-0.53,-0.53),each=441), high=rep(c(0.125,0.125),each=441))
+                        
+                                                  
+mean.exotic<-mean(adults$exotic_tree)
+sd.exotic<-sd(adults$exotic_tree)
+
+prediction$unscaled<-prediction$exotic*sd.exotic+mean.exotic
+
+                        
+prediction$mu1<-(exp(prediction$mean.phi+prediction$beta*prediction$exotic)/
+                          (1+exp(prediction$mean.phi+prediction$beta*prediction$exotic)))      
+                          
+prediction$lower<-(exp(prediction$mean.phi+prediction$low*prediction$exotic)/
+                          (1+exp(prediction$mean.phi+prediction$low*prediction$exotic)))  
+                          
+prediction$upper<-(exp(prediction$mean.phi+prediction$high*prediction$exotic)/
+                          (1+exp(prediction$mean.phi+prediction$high*prediction$exotic)))  
+                          
+                          
+  
+
+                          
+
+library(ggplot2)
+
+
+graph<-ggplot(data=prediction, aes(x=unscaled, y=mu1, group=sex)) + 
+              geom_line(aes(color=sex)) + 
+              geom_ribbon(data=prediction,aes(ymin=lower,ymax=upper, group=sex,fill=sex), alpha=0.3)
+graph
+
+
+## Plot the predictions
+## R2JAGS/R2WINBUGS USERS:
+turnout.mcmc <- as.mcmc(cjs.exotic)
+turnout.mat <- as.matrix(turnout.mcmc)
+b <- turnout.mat[ , 1:1] ## one column for each coefficient, in this case I had 6 coefficients
+
+# Generate vector with the simulated range of X1 (here, age)
+new.exotic<-prediction<-data.frame(exotic=rep(seq(0,200, by=1),2), 
+                        sex=as.factor(rep(1:2,each=402)),
+                        constant=1)
+                        
+# Multiply X by the betas from your BUGS output
+Xb <- t(new.exotic$exotic%*% t(b))
+
+# Transform linear prediction to probability
+turnout.pp.exotic <- exp(Xb)/(1+exp(Xb))
+
+# Get CIs (for plotting)
+turnout.ci.exotic <- apply(turnout.pp.exotic, 2, quantile, probs=c(.025,.975)) 
+## apply(a, b, c): apply function (c) to object(a), by(b: 1 for row, 2 for column)
+
+# Get mean predictions over the n (from BUGS/JAGS iterations) sampled values of b
+mean.turnout.pp.exotic <- apply(turnout.pp.exotic, 2, mean)
+mean.turnout.ci.exotic <- apply(turnout.ci.exotic, 2, quantile, probs=c(.025,.975))
+
+# Plot mean probability against the full (simulated) range of X (=age)
+plot(new.exotic$exotic, mean.turnout.pp.exotic, pch=19, main="Predicted probability", xlab="exotic", ylab="Pr(survival)", xlim=c(min(new.exotic$exotic), max(new.exotic$exotic)), ylim=c(0,1))
+
+# Add standard errors as vertical lines (could also do this using 2.5% and 97.5% values from p.chains)
+segments(new.exotic$exotic, mean.turnout.ci.exotic[1, ], new.exotic$exotic, mean.turnout.ci.exotic[2, ], lty=1)
+
+
+
+
+
+                          
+```
