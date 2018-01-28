@@ -1,0 +1,459 @@
+---
+title: "Chickadee Annual Survival Model in JAGS"
+author: "DLN"
+date: "August 8, 2017"
+output:
+  word_document: default
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    toc_float: yes
+---
+<img src="C:/Users/dnarango/Pictures/CACH project/chickadee_eggs.jpg"alt="Alt text" style="width: 200px;"/>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###############################################################################################
+###### Estimation of survival from capture-recapture data using the Cormack-Jolly-Seber (CJS) model implemented in JAGS
+###############################################################################################
+#Data Setup
+###Get packages and drive ready
+```{r message=FALSE}
+#Load packages
+library(stringr)
+library(R2WinBUGS)
+library(R2jags)
+
+library(tidyr)
+library(dplyr)
+
+library(ggplot2)
+
+#Set up working drive
+setwd("C:/Users/dnarango/Documents/Manuscripts/demography_exoticplants/analysis/survival")
+```
+##Create Capture Histories
+First we need to format the banding data into usable capture histories
+```{r format banding data}
+survival<-read.csv("C:/Users/dnarango/Documents/Manuscripts/demography_exoticplants/Chapter 2 - demography/csv/totalresights_CACH.csv") %>%
+              select(-hub,-species,-colorcombo,-encounterTypeQuery,-ID) %>%
+              group_by(site, year, bandNumberQuery) %>%
+              summarise(observations=n()) %>%
+              mutate(obs=1) %>%
+              filter(bandNumberQuery!=".", bandNumberQuery!="") %>%
+              spread(year, obs, fill=0) %>%
+              mutate('2006'=NA,"2011"=NA) %>%
+              gather(year,obs,4:20) %>%
+              group_by(site, year, bandNumberQuery) %>%
+              summarise(observation=max(obs)) %>%
+              spread(year, observation) 
+
+colnames(survival)<-c("site","bandNumberQuery","cap2000","cap2001","cap2002","cap2003","cap2004","cap2005","cap2006","cap2007","cap2008","cap2009","cap2010","cap2011","cap2012","cap2013","cap2014","cap2015","cap2016")
+
+new_survival<-survival %>%
+              select(site,bandNumberQuery,cap2000:cap2016)
+
+
+## Create capture history
+new_survival$capture_history <- as.character(apply( new_survival[ , 3:19] , 1 , paste , collapse = "" ))
+
+
+##Create years seen
+new_survival$years_seen<-rowSums(new_survival[,c(3:19)], na.rm=TRUE)
+new_survival2<-filter(new_survival,years_seen>0)
+
+### Save data in case you need it for future use
+currentDate <- Sys.Date() 
+csvFileName <- paste("C:/Users/dnarango/Documents/Manuscripts/demography_exoticplants/analysis/survival","capturehistory_",currentDate,".csv",sep="") 
+write.csv(new_survival2, file=csvFileName)
+```
+##Formatting Data
+```{r}
+## Upload Data
+## Chickadee Encounters
+       
+ch<-new_survival2 %>%
+    mutate(bandnum=bandNumberQuery) %>%
+    mutate(ch=capture_history) %>%
+    select(site, bandnum,ch, years_seen)
+
+
+## Year Data
+year<-read.csv("yearvalues_12feb2017.csv") %>%
+  select(year, peakcherry_juldate, average_wintertemp)
+
+## Body Condition
+bodycondition<-read.csv("CACH_bodycondition_2017-03-01.csv") %>%
+  mutate(site=site.x) %>%
+  mutate(date=date.x) %>%
+  mutate(month=strftime(date,"%m"))%>%
+   select(bandnum, age, date, sex, month,condition)
+
+## Imperv
+imperv<-read.csv("C:/Users/dnarango/Documents/TO GO THROUGH/GIS SPATIAL LAYERS - IMPERV/Imperv_buffer_100_2017-03-01.csv") %>%
+  mutate(site=id) %>%  
+  select(site, per_imperv)
+    
+
+
+## Plants
+exotic<-read.csv("C:/Users/dnarango/Desktop/veg_test/results/origin_importancevalues_NN_results_2018-01-27_format.csv") %>%
+  select(site, proportion_exotic)
+
+```
+##Data Manipulation
+```{r message=FALSE, warning=FALSE}
+
+
+## Add Data Together
+survival_ch<-new_survival %>%
+    #left_join(imperv, by="site") %>%
+    rename(bandnum=bandNumberQuery) %>%
+    rename(ch=capture_history) %>%
+    left_join(bodycondition, by="bandnum") %>%
+    left_join(exotic, by="site")
+          
+## Adds the mean where there are NAs
+#survival$per_imperv[is.na(survival$per_imperv)]<-mean(na.omit(survival$per_imperv))
+
+
+## Include only adults with known sex
+## Include only birds caught during the breeding season (or resighted)
+adults<-survival_ch %>%
+        mutate(month_num=as.numeric(month)) %>%
+        #filter(month_num<8 | years_seen>1) %>%  ## here we're specifying that only breeding ind used
+        filter(age!="HY" | years_seen>1)%>%
+        filter(age!="L")%>%
+        filter(age!="U"| years_seen>1)%>%
+        filter(age!="ASY?"| years_seen>1) %>%
+        #filter(sex!="M?") %>%
+        #filter(sex!="UNK") %>%
+        #filter(sex!="U")
+        filter(sex!="NA")
+        
+adults$sex<-as.character(adults$sex)
+adults$sex[adults$sex=="M?"]<-"M"
+adults$sex[adults$sex=="UNK"]<-"U"
+
+adults[which(adults$site=="stuechrva2"),27]<-0.59818134  ##should be steuchrva2
+adults[which(adults$site=="stuechrmd1"),27]<-0.59818134  ##should be steuchrva2
+adults[which(adults$site=="steuchrva1"),27]<-0.59818134  ##should be steuchrva2
+
+adults[which(adults$site=="milljoymd1"),27]<-0.45759510  ##should be milljoemd1
+adults[which(adults$site=="hulljefmd1"),27]<-0.35890030  ##should be hulljefva1
+adults[which(adults$site=="fishfermd1"),27]<-0.44583132  ##should be hulljefva1
+adults[which(adults$site=="becksusmd1"),27]<-0.30526046  ##should be hulljefva1
+adults[which(adults$site=="andrkenva1"),27]<-0.01517451  ##should be hulljefva1
+adults[which(adults$site=="vongjenva1"),27]<-0.44297542  ##should be hulljefva1
+adults[which(adults$site=="thombarva1"),27]<-0.53859303  ##should be hulljefva1
+adults[which(adults$site=="sollchrvamd1"),27]<-0.25017764  ##should be hulljefva1
+adults[which(adults$bandnum=="2690-95981"),27]<-0.54375316  ##should be hulljefva1
+adults[which(adults$bandnum=="2710-25936"),27]<-0.18745355  ##should be hulljefva1
+
+
+
+adults_format<-adults%>%filter(proportion_exotic!="NA")
+
+
+nrow(adults)
+
+```
+
+##Construct Matrix
+```{r}
+### need a matrix with x: capture year and y: individual
+
+#[,1] [,2] [,3] [,4] [,5] [,6]
+#[1,]    1    0    0    0    0    0
+#[2,]    1    0    0    0    0    0
+#[3,]    1    1    1    1    1    1
+#[4,]    1    1    0    0    0    0
+#[5,]    1    0    0    0    0    0
+#[6,]    1    1    0    0    1    0
+
+#ch<-as.matrix(str_split_fixed(adults$ch, "", 19))
+ch<-as.matrix(adults_format[3:19])
+
+class(ch) <- "numeric" 
+matrix<-ch
+
+## also need vector with marking occassion (year marked)
+get.first <- function(x) min(which(x!=0)) #make function
+VECTOR <- apply(matrix, 1, get.first)
+```
+## Construct the model code for JAGS
+```{r functions for JAGS}
+known.state.cjs <- function(ch){
+  state <- ch
+  for (i in 1:dim(ch)[1]){
+    n1 <- min(which(ch[i,]==1))
+    n2 <- max(which(ch[i,]==1))
+    state[i,n1:n2] <- 1
+    state[i,n1] <- NA
+  }
+  state[state==0] <- NA
+  return(state)
+}
+```
+
+# Make the model 
+###Set up a base model
+```{r eval=FALSE}
+
+# Specify model in BUGS language
+sink("cjs-c-c.bug")
+cat("                          ##starts the bugs code
+    model {
+      
+# Priors and constraints
+      phi ~ dunif(0, 1)            ### Uniform priors  (could use: phi[i,t] <- mean.phi for mean survival)
+      p ~ dunif(0, 1)             ### Uniform priors
+      
+      
+      # Likelihood 
+      for (i in 1:nind){
+        # Define latent state at first capture
+        z[i,f[i]] <- 1
+        for (t in (f[i]+1):n.occasions){
+          
+          # State process
+          z[i,t] ~ dbern(mu1[i,t])
+          mu1[i,t] <- phi * z[i,t-1]		# Depends on whether ind was alive the time before
+          
+          # Observation process
+          y[i,t] ~ dbern(mu2[i,t])
+          mu2[i,t] <- p * z[i,t]			# Depends on the whether ind alive that time period
+        } #t
+      } #i
+    }
+    ",fill = TRUE)
+sink()
+```
+### Bundle Data
+```{r}
+# Bundle data
+bugs.data <- list(y = matrix, f = VECTOR, nind = nrow(matrix), n.occasions = ncol(matrix))
+
+# Function to create a matrix of initial values for latent state z
+ch.init <- function(ch, f){
+  for (i in 1:dim(ch)[1]){ch[i,1:f[i]] <- NA}
+  return(ch)
+}
+
+# Initial values
+inits <- function(){list(z = ch.init(matrix, VECTOR), phi = runif(1, 0, 1), p = runif(1, 0, 1))}
+
+# Parameters monitored
+parameters <- c("phi", "p")
+
+# MCMC settings
+ni <- 1000
+nt <- 6
+nb <- 500
+nc <- 3
+# To run in JAGS
+# In JAGS we have to give good initial values for the latent state z. At all occasions when an individual was 
+# observed, its state is z = 1 for sure. In addition, if an individual was not observed at an occasion, 
+#but was alive for sure, because it was observed before and thereafter (i.e. has a capture history of e.g. {101} 
+#or {10001}), then we know that the individual was alive at all of these occasions, and thus z = 1. 
+#Therefore, we should provide initial values of z = 1 at these positions as well. The following function 
+#provides such initial values from the observed capture histories:
+
+known.state.cjs <- function(ch){
+  state <- ch
+  for (i in 1:dim(ch)[1]){
+    n1 <- min(which(ch[i,]==1))
+    n2 <- max(which(ch[i,]==1))
+    state[i,n1:n2] <- 1
+    state[i,n1] <- NA
+  }
+  state[state==0] <- NA
+  return(state)
+}
+
+JAGS_inits <- function(){list(phi = runif(1, 0, 1), p = runif(1, 0, 1), z = known.state.cjs(matrix))}
+
+cjs.c.cJ <- jags(bugs.data, JAGS_inits, parameters, "C:/Users/dnarango/Documents/Manuscripts/demography_exoticplants/analysis/survival/cjs-c-c.bug", n.chains = nc, n.thin = nt, n.iter = ni, n.burnin = nb)
+
+# Summarize posteriors
+print(cjs.c.cJ, digits = 3)
+
+```
+
+# Real model
+Includes survival by sex, fixed effects exotic and allows survival to vary each year
+Code for impervious is included but not run in this model right now
+```{r eval=FALSE}
+# Specify model in BUGS language
+bugs.dir=("C:/Program Files (x86)/WinBUGS14")
+
+sink("cjs-sex_time_exotic_imperv.bug")
+cat("                          ##starts the bugs code
+    model {
+      
+# Priors and constraints
+for(s in 1:3){
+p[s] ~ dunif(0, 1)             ### Uniform priors differs by sex 
+for(t in 1:n.occasions){
+phi.t[s,t] ~ dunif(0, 1) ### Uniform priors  (could use: phi[i,t] <- mean.phi for mean survival)
+}
+}
+
+for(n in 1:ncovs){
+beta[n]~dnorm(0,0.001)
+}
+
+      # Likelihood 
+      for (i in 1:nind){
+        # Define latent state at first capture
+        z[i,f[i]] <- 1
+
+        for (t in (f[i]+1):n.occasions){
+          
+          # State process
+          z[i,t] ~ dbern(mu1[i,t])
+          
+          mu1[i,t] <- (exp(phi.t[sex[i],t]+
+                          beta[1]*exotic[i]
+                          #beta[2]*imperv[i]*
+                          *z[i,t-1])/
+                      (1 + exp(phi.t[sex[i],t]+
+                          beta[1]*exotic[i]
+                          #beta[2]*imperv[i]
+                          *z[i,t-1])))  # Depends on whether ind was alive the time before
+          
+          # Observation process
+          y[i,t] ~ dbern(mu2[i,t])
+          mu2[i,t] <- p[sex[i]] * z[i,t]			# Depends on the whether ind alive that time period
+        } #t
+      } #i
+# Derived paramters
+for(s in 1:3){ #sex
+mean.phi[s]<-mean(phi.t[s,])
+}
+# get survival across exotic ##
+m.phi1 <- mean(phi.t[1,]) 
+m.phi2 <- mean(phi.t[2,]) 
+for(i in 1:200){
+pred.1[i] <- exp(m.phi1+beta[1]*pr.exotic[i])/(1 + exp(m.phi1+beta[1]*pr.exotic[i]))
+pred.2[i] <- exp(m.phi2+beta[1]*pr.exotic[i])/(1 + exp(m.phi2+beta[1]*pr.exotic[i]))
+}
+}
+    ",fill = TRUE)
+sink()
+```
+
+```{r}
+## Create  bugs data
+occasions<-ncol(ch)
+covariates<-2
+
+adults2<-adults_format %>%
+          mutate(sex2=ifelse(sex=="F",1,ifelse(sex=="M",2,ifelse(sex=="M?",2,3))))
+sex<-adults2$sex2
+
+adults_format$total_exotic<-adults_format$proportion_exotic
+exotic<-(adults_format$total_exotic-mean(adults_format$total_exotic))/sd(adults_format$total_exotic)
+
+pr.exotic <- seq(min(exotic),max(exotic),,200)
+
+individuals<-nrow(matrix)
+
+
+bugs.data <- list(nind=individuals,
+                  n.occasions = occasions,
+                  ncovs = covariates,
+                  sex = sex,
+                  exotic = exotic,
+                 # imperv = 
+                  y = matrix,
+                  f=VECTOR,
+                  pr.exotic = pr.exotic)
+                  
+                  
+# Function to create a matrix of initial values for latent state z
+ch.init <- function(ch, f){
+  for (i in 1:dim(ch)[1]){ch[i,1:f[i]] <- NA}
+  return(ch)
+}
+
+# Initial values
+inits <- function(){list(z = ch.init(matrix, VECTOR), phi = runif(1, 0, 1), p = runif(1, 0, 1))}
+
+JAGS_inits <- function(){list(z = known.state.cjs(matrix))}
+
+
+#parameters monitored
+parameters <- c("mean.phi","beta","phi.t","p","pred.1","pred.2", "m.phi1","m.phi2")
+
+# MCMC settings
+ni <- 500000
+nt <- 6
+nb <- 50000
+nc <- 3
+
+cjs.exotic <- jags(data = bugs.data, 
+                 inits = JAGS_inits, 
+                 parameters.to.save = parameters, 
+                 model = "C:/Users/dnarango/Documents/Manuscripts/demography_exoticplants/analysis/survival/cjs-sex_time_exotic_imperv.bug", 
+                 n.chains = nc,
+                 n.thin = nt,
+                 n.iter = ni,
+                 n.burnin = nb)
+
+# Summarize posteriors
+print(cjs.exotic, digits = 3)
+
+
+```
+# Make Graphs
+```{r}
+
+error1 <- apply(cjs.exotic$BUGSoutput$sims.list$pred.1,2,quantile,probs = c(0.975,0.025))
+exotic.scale <- ((pr.exotic*sd(adults$total_exotic))+mean(adults$total_exotic))/2
+mean_phi<-cjs.exotic$BUGSoutput$mean$pred.1
+vector<-(0:199)
+survival_predictions<-data.frame(mean_phi, vector, t(error1))
+survival_predictions$exotic<-vector/2
+
+#write
+date<-Sys.Date()
+write.csv(survival_predictions, paste0("jags_survival_results_",date,".csv"))
+
+##Graph in base
+par(bty="l")
+plot(cjs.exotic$BUGSoutput$mean$pred.1 ~ exotic.scale, ylim =c(0,1), type = "l",
+     ylab = expression(paste("Female ", phi)),xlab="Nonnative plants",yaxt = "n",xaxt="n")
+axis(2,las =2)
+axis(1,at=c(0,25,50,75,100), labels=c(0,25,50,75,100))
+polygon(c(exotic.scale,rev(exotic.scale)),c(error1[1,],rev(error1[2,])), col = "gray90", border = "white")
+points(cjs.exotic$BUGSoutput$mean$pred.1 ~ exotic.scale, type = "l")
+
+
+survival_df<-data.frame(exotic.scale,mean_phi, lower=error1[2,], higher=error1[1,])
+
+###Graph in ggplot
+graph<-ggplot(data=survival_predictions, aes(x=exotic,y=mean_phi))+
+                geom_line(color="black", size=1) + geom_ribbon(aes(ymin=error1[2,], ymax=error1[1,]), 
+                                          fill="gray80", alpha=0.5) + coord_cartesian(ylim=c(0,1))
+
+graph + labs(x="Nonnative Plants", y=expression(paste("Female ",phi))) + 
+  theme_minimal()  +
+  scale_x_continuous(breaks = c(0,25,50,75,100), labels = c("0%", "25%", "50%","75%","100%"))+
+  
+  theme(axis.title = element_text(color="black", face="bold", size=20), 
+        axis.text.y = element_text(face="bold", color="gray50", size=12),
+        axis.text.x = element_text(face="bold", color="gray50", size=12),
+        axis.line.x = element_line(colour = "black"), 
+        axis.line.y = element_line(colour = "black"),
+        axis.ticks = element_line(size=0.5),
+        panel.background=element_rect(fill="white", colour = "white"),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+date<-Sys.Date()
+ggsave(paste("survival_jagsmodel_withCI-",date,".jpg"), width=8.5, height=6.25, units="in") 
+```
+
